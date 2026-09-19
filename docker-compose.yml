@@ -1,0 +1,137 @@
+name: hotel-offer-orchestrator
+
+services:
+  # --------------------------------------------------------------------------
+  # Infrastructure
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: hoo-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgresql:
+    image: postgres:15-alpine
+    container_name: hoo-postgres
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.27.2
+    container_name: hoo-temporal
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgresql
+      - DEFAULT_NAMESPACE=default
+      - DEFAULT_NAMESPACE_RETENTION=24h
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ./docker/dynamicconfig:/etc/temporal/config/dynamicconfig
+    ports:
+      - "7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    container_name: hoo-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+
+  # --------------------------------------------------------------------------
+  # Application: the API and the Temporal worker share one image.
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hotel-offer-orchestrator:latest
+    container_name: hoo-api
+    command: ["node", "dist/api/server.js"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: info
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SECONDS: 300
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: hotel-offers
+      SUPPLIER_A_URL: http://api:3000/supplierA/hotels
+      SUPPLIER_B_URL: http://api:3000/supplierB/hotels
+      SUPPLIER_TIMEOUT_MS: 3000
+      SUPPLIER_PRICE_JITTER_PCT: 0
+    ports:
+      # Override the host port if 3000 is taken: API_PORT=3100 docker compose up
+      - "${API_PORT:-3000}:3000"
+    restart: unless-stopped
+
+  worker:
+    # Same Dockerfile and build cache as `api`, just a different entrypoint.
+    # It needs its own tag: two services exporting one tag race in BuildKit.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hotel-offer-orchestrator-worker:latest
+    container_name: hoo-worker
+    command: ["node", "dist/temporal/worker.js"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      api:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SECONDS: 300
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: hotel-offers
+      # The worker calls the suppliers over the network, like a real integration.
+      SUPPLIER_A_URL: http://api:3000/supplierA/hotels
+      SUPPLIER_B_URL: http://api:3000/supplierB/hotels
+      SUPPLIER_TIMEOUT_MS: 3000
+      WORKER_MAX_CONCURRENT_ACTIVITIES: 50
+    # The worker polls Temporal instead of serving HTTP, so the image-level
+    # HTTP healthcheck does not apply to it.
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:

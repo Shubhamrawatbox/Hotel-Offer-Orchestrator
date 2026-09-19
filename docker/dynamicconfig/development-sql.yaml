@@ -1,0 +1,7 @@
+# Minimal Temporal dynamic config for local development.
+limit.maxIDLength:
+  - value: 255
+    constraints: {}
+system.forceSearchAttributesCacheRefreshOnRead:
+  - value: true # Dev-only: makes new search attributes visible immediately.
+    constraints: {}
