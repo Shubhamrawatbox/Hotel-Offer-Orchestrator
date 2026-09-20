@@ -12,3 +12,7 @@ docker-compose.yml
 tests
 .vscode
 .idea
+
+# The UI has its own image (web/Dockerfile); keep it, and its node_modules,
+# out of the API build context.
+web

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { config } from '../../config';
 import { pingRedis } from '../../redis/client';
 import { probeSupplier, supplierUrl } from '../../suppliers/supplierClient';
-import { pingTemporal } from '../../temporal/client';
+import { checkWorkers, pingTemporal } from '../../temporal/client';
 import { asyncHandler } from '../middleware';
 
 export const healthRouter: Router = Router();
@@ -23,11 +23,19 @@ healthRouter.get('/health/live', (_req, res) => {
 healthRouter.get(
   '/health/ready',
   asyncHandler(async (_req, res) => {
-    const [redis, temporal] = await Promise.all([pingRedis(), pingTemporal()]);
-    const ready = redis.ok && temporal.ok;
+    const [redis, temporal, worker] = await Promise.all([
+      pingRedis(),
+      pingTemporal(),
+      checkWorkers(),
+    ]);
+    const ready = redis.ok && temporal.ok && worker.ok;
     res.status(ready ? 200 : 503).json({
       status: ready ? 'ready' : 'not_ready',
-      checks: { redis: toCheck(redis), temporal: toCheck(temporal) },
+      checks: {
+        redis: toCheck(redis),
+        temporal: toCheck(temporal),
+        worker: toCheck(worker, { pollers: worker.pollers ?? 0 }),
+      },
     });
   }),
 );
@@ -37,20 +45,23 @@ healthRouter.get(
  *
  *  ok       everything reachable
  *  degraded one supplier is down — results will be partial but still served
- *  down     Redis or Temporal is unreachable, or no supplier is reachable
+ *  down     Redis, Temporal or the worker is unavailable, or no supplier is reachable
  */
 healthRouter.get(
   '/health',
   asyncHandler(async (_req, res) => {
     const startedAt = Date.now();
-    const [redis, temporal, supplierA, supplierB] = await Promise.all([
+    const [redis, temporal, worker, supplierA, supplierB] = await Promise.all([
       pingRedis(),
       pingTemporal(),
+      checkWorkers(),
       probeSupplier('A'),
       probeSupplier('B'),
     ]);
 
-    const coreUp = redis.ok && temporal.ok;
+    // A task queue with no pollers cannot run the orchestration at all, so the
+    // worker counts as a core dependency alongside Redis and Temporal.
+    const coreUp = redis.ok && temporal.ok && worker.ok;
     const suppliersUp = [supplierA.ok, supplierB.ok].filter(Boolean).length;
 
     const status = !coreUp || suppliersUp === 0 ? 'down' : suppliersUp === 2 ? 'ok' : 'degraded';
@@ -67,6 +78,10 @@ healthRouter.get(
           address: config.TEMPORAL_ADDRESS,
           namespace: config.TEMPORAL_NAMESPACE,
           taskQueue: config.TEMPORAL_TASK_QUEUE,
+        }),
+        worker: toCheck(worker, {
+          taskQueue: config.TEMPORAL_TASK_QUEUE,
+          pollers: worker.pollers ?? 0,
         }),
         supplierA: toCheck(supplierA, { url: supplierUrl('A') }),
         supplierB: toCheck(supplierB, { url: supplierUrl('B') }),

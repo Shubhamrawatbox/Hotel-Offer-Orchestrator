@@ -1,5 +1,5 @@
 import { WorkflowFailedError } from '@temporalio/client';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, TimeoutFailure } from '@temporalio/common';
 import { config } from '../config';
 import { AppError } from '../api/errors';
 import { errorInfo, logger } from '../logger';
@@ -75,6 +75,20 @@ function translateWorkflowError(error: unknown, workflowId: string, input: Hotel
 
     log.error({ workflowId, city: input.city, failureType, message }, 'Workflow failed');
 
+    // A workflow that never completes is almost always a workflow nothing picked
+    // up: the API started it, but no worker is polling the task queue. Say that,
+    // rather than reporting a generic failure.
+    if (isTimeout(error)) {
+      return new AppError(
+        504,
+        'ORCHESTRATION_TIMEOUT',
+        `The hotel search did not complete within ${config.WORKFLOW_EXECUTION_TIMEOUT_MS}ms. ` +
+          `This usually means no Temporal worker is polling the "${TASK_QUEUE}" task queue — ` +
+          `check that the worker process is running (docker compose ps worker).`,
+        { cause: error },
+      );
+    }
+
     switch (failureType) {
       case 'AllSuppliersUnavailable':
         return new AppError(502, 'ALL_SUPPLIERS_UNAVAILABLE', message, { cause: error });
@@ -91,4 +105,13 @@ function translateWorkflowError(error: unknown, workflowId: string, input: Hotel
   return new AppError(503, 'ORCHESTRATOR_UNAVAILABLE', 'The orchestration service is currently unavailable', {
     cause: error,
   });
+}
+
+/**
+ * An execution timeout arrives as a WorkflowFailedError with no cause and the
+ * message "Workflow execution timed out"; activity-level timeouts arrive as a
+ * TimeoutFailure cause. Both mean the same thing to the caller.
+ */
+function isTimeout(error: WorkflowFailedError): boolean {
+  return error.cause instanceof TimeoutFailure || /timed out/i.test(error.message);
 }

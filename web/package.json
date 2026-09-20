@@ -1,0 +1,30 @@
+{
+  "name": "hotel-offer-orchestrator-web",
+  "private": true,
+  "version": "1.0.0",
+  "description": "React UI for the Hotel Offer Orchestrator: search, compare supplier quotes, watch system health and simulate outages.",
+  "type": "module",
+  "engines": {
+    "node": "^20.0.0 || >=22.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "~5.9.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
+  }
+}

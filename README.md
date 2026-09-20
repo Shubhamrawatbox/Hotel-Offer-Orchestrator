@@ -214,6 +214,7 @@ shape:
 | `502`  | `ALL_SUPPLIERS_UNAVAILABLE` | Neither supplier could be reached               |
 | `503`  | `ORCHESTRATOR_UNAVAILABLE`  | Temporal is unreachable                         |
 | `503`  | `CACHE_UNAVAILABLE`         | Redis lost the cached city mid-request          |
+| `504`  | `ORCHESTRATION_TIMEOUT`     | The workflow did not finish in time — almost always **no worker is polling the task queue** |
 | `500`  | `INTERNAL_ERROR`            | Anything unexpected                             |
 
 A city that neither supplier covers is **not** an error — it returns `200` with `[]`.
@@ -237,7 +238,7 @@ The mock supplier APIs. Optional `?city=` narrows the feed; omitting it returns 
 
 ### `GET /health`
 
-Reports Redis, Temporal **and both suppliers** individually.
+Reports Redis, Temporal, **the worker** and **both suppliers** individually.
 
 ```json
 {
@@ -249,6 +250,7 @@ Reports Redis, Temporal **and both suppliers** individually.
   "checks": {
     "redis":     { "status": "up",   "latencyMs": 2,  "url": "redis://redis:6379" },
     "temporal":  { "status": "up",   "latencyMs": 8,  "address": "temporal:7233", "namespace": "default", "taskQueue": "hotel-offers" },
+    "worker":    { "status": "up",   "latencyMs": 5,  "taskQueue": "hotel-offers", "pollers": 1 },
     "supplierA": { "status": "down", "latencyMs": 12, "error": "HTTP 503", "url": "http://api:3000/supplierA/hotels" },
     "supplierB": { "status": "up",   "latencyMs": 6,  "url": "http://api:3000/supplierB/hotels" }
   }
@@ -259,10 +261,18 @@ Reports Redis, Temporal **and both suppliers** individually.
 | ---------- | ----- | -------------------------------------------------------------- |
 | `ok`       | `200` | Everything reachable                                           |
 | `degraded` | `200` | One supplier is down — results will be partial but still served |
-| `down`     | `503` | Redis or Temporal is unreachable, or **no** supplier is reachable |
+| `down`     | `503` | Redis, Temporal or the worker is unavailable, or **no** supplier is reachable |
 
-`GET /health/live` (process liveness, no dependencies) and `GET /health/ready` (Redis + Temporal
-only) are also available for container probes.
+The `worker` check asks Temporal who is polling the task queue. Zero pollers means requests would be
+accepted and then sit until they time out, so it counts as a core dependency rather than something a
+caller has to discover the hard way.
+
+> Temporal keeps reporting a poller for a while after the worker behind it is gone, so the check
+> ignores pollers that have not polled in the last 120 seconds. A worker that has *just* died can
+> still show as up for up to two minutes; a worker that was never started shows as down immediately.
+
+`GET /health/live` (process liveness, no dependencies) and `GET /health/ready` (Redis, Temporal and
+the worker) are also available for container probes.
 
 ### Admin / test helpers
 
@@ -550,13 +560,35 @@ not a failure. Reserving error statuses for actual errors keeps client logic sim
 
 ## Troubleshooting
 
-**`/api/hotels` hangs, then returns `503 ORCHESTRATOR_UNAVAILABLE`.**
-The worker is not running or is polling a different task queue. Check `docker compose logs worker`
-for `Worker started and polling` and confirm `TEMPORAL_TASK_QUEUE` matches on both processes.
+**`/api/hotels` hangs for 60s, then returns `504 ORCHESTRATION_TIMEOUT`.**
+Nothing is polling the task queue, so the workflow was accepted and never picked up. Check
+`GET /health` — the `worker` check will show `pollers: 0`. Then:
 
-**`ports are not available: ... bind: address already in use`.**
-Something else holds port 3000. Start with `API_PORT=3100 docker compose up` and use
-`http://localhost:3100`.
+```bash
+docker compose ps -a worker
+```
+
+If it is `Exited` or `Created`, start it with `docker compose up -d worker` and check
+`docker compose logs worker` for `Worker started and polling`. If the worker *is* running, confirm
+`TEMPORAL_TASK_QUEUE` matches on both processes.
+
+**`ports are not available: ... bind: address already in use`, and `docker compose ps -a` shows
+`hoo-api` / `hoo-worker` stuck in `Created`.**
+Something else already holds port 3000 — often a stray `node dist/api/server.js` left over from a
+previous local run. Compose creates the containers but cannot start the API, so the stack comes up
+half-built. Find and stop the offender:
+
+```bash
+netstat -ano | findstr ":3000 " | findstr LISTENING
+```
+
+Then `taskkill /PID <pid> /F` (Windows) or `kill <pid>` (macOS/Linux), and run
+`docker compose up -d` again. Or leave it alone and use a different host port:
+`API_PORT=3100 docker compose up`.
+
+> This combination is worth recognising: a stray API on 3000 keeps answering requests while the
+> Compose API and worker never start, so `/api/hotels` reaches an API with no worker behind it and
+> every request ends in `504 ORCHESTRATION_TIMEOUT`.
 
 **Worker logs `Temporal not reachable yet, retrying`.**
 Normal on a cold start — the Temporal server runs its schema setup first. The worker retries for
